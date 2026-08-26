@@ -268,9 +268,9 @@ class AllegroHandHora(VecTask):
             scale_key = str(obj_scale)
             sampled_pose_idx = np.random.randint(self.saved_grasping_states[scale_key].shape[0], size=len(s_ids))
             sampled_pose = self.saved_grasping_states[scale_key][sampled_pose_idx].clone()
-            self.root_state_tensor[self.object_indices[s_ids], :7] = sampled_pose[:, self.num_allegro_hand_dofs:]
+            self.root_state_tensor[self.object_indices[s_ids], :7] = sampled_pose[:, 16:]
             self.root_state_tensor[self.object_indices[s_ids], 7:13] = 0
-            pos = sampled_pose[:, :self.num_allegro_hand_dofs]
+            pos = sampled_pose[:, :16]
             self.allegro_hand_dof_pos[s_ids, :] = pos
             self.allegro_hand_dof_vel[s_ids, :] = 0
             self.prev_targets[s_ids, :self.num_allegro_hand_dofs] = pos
@@ -305,11 +305,11 @@ class AllegroHandHora(VecTask):
 
         # refill the initialized buffers
         at_reset_env_ids = self.at_reset_buf.nonzero(as_tuple=False).squeeze(-1)
-        self.obs_buf_lag_history[at_reset_env_ids, :, 0:self.num_allegro_hand_dofs] = unscale(
+        self.obs_buf_lag_history[at_reset_env_ids, :, 0:16] = unscale(
             self.allegro_hand_dof_pos[at_reset_env_ids], self.allegro_hand_dof_lower_limits,
             self.allegro_hand_dof_upper_limits
         ).clone().unsqueeze(1)
-        self.obs_buf_lag_history[at_reset_env_ids, :, self.num_allegro_hand_dofs:2 * self.num_allegro_hand_dofs] = self.allegro_hand_dof_pos[at_reset_env_ids].unsqueeze(1)
+        self.obs_buf_lag_history[at_reset_env_ids, :, 16:32] = self.allegro_hand_dof_pos[at_reset_env_ids].unsqueeze(1)
         t_buf = (self.obs_buf_lag_history[:, -3:].reshape(self.num_envs, -1)).clone()
 
         self.obs_buf[:, :t_buf.shape[1]] = t_buf
@@ -531,33 +531,29 @@ class AllegroHandHora(VecTask):
         assert (sum(raw_prob) == 1)
 
         primitive_list = self.object_type.split('+')
-        _aroot = os.path.join(os.path.dirname(os.path.abspath(__file__)), '../../')
         print('---- Primitive List ----')
         print(primitive_list)
         self.object_type_prob = []
         self.object_type_list = []
         self.asset_files_dict = {
             'simple_tennis_ball': 'assets/ball.urdf',
-            'cube': 'assets/cube.urdf',
-            'cyl': 'assets/cylinder.urdf',
-            'box0': 'assets/cuboid/default/0000.urdf',
         }
         for p_id, prim in enumerate(primitive_list):
             if 'cuboid' in prim:
                 subset_name = self.object_type.split('_')[-1]
-                cuboids = sorted(glob(f'{_aroot}/assets/cuboid/{subset_name}/*.urdf'))
+                cuboids = sorted(glob(f'../assets/cuboid/{subset_name}/*.urdf'))
                 cuboid_list = [f'cuboid_{i}' for i in range(len(cuboids))]
                 self.object_type_list += cuboid_list
                 for i, name in enumerate(cuboids):
-                    self.asset_files_dict[f'cuboid_{i}'] = os.path.relpath(name, _aroot)
+                    self.asset_files_dict[f'cuboid_{i}'] = name.replace('../assets/', '')
                 self.object_type_prob += [raw_prob[p_id] / len(cuboid_list) for _ in cuboid_list]
             elif 'cylinder' in prim:
                 subset_name = self.object_type.split('_')[-1]
-                cylinders = sorted(glob(f'{_aroot}/assets/cylinder/{subset_name}/*.urdf'))
+                cylinders = sorted(glob(f'assets/cylinder/{subset_name}/*.urdf'))
                 cylinder_list = [f'cylinder_{i}' for i in range(len(cylinders))]
                 self.object_type_list += cylinder_list
                 for i, name in enumerate(cylinders):
-                    self.asset_files_dict[f'cylinder_{i}'] = os.path.relpath(name, _aroot)
+                    self.asset_files_dict[f'cylinder_{i}'] = name.replace('../assets/', '')
                 self.object_type_prob += [raw_prob[p_id] / len(cylinder_list) for _ in cylinder_list]
             else:
                 self.object_type_list += [prim]
@@ -571,7 +567,7 @@ class AllegroHandHora(VecTask):
         self.prop_hist_len = self.config['env']['hora']['propHistoryLen']
         self.num_env_factors = self.config['env']['hora']['privInfoDim']
         self.priv_info_buf = torch.zeros((num_envs, self.num_env_factors), device=self.device, dtype=torch.float)
-        self.proprio_hist_buf = torch.zeros((num_envs, self.prop_hist_len, self.config['env']['numObservations'] // 3), device=self.device, dtype=torch.float)
+        self.proprio_hist_buf = torch.zeros((num_envs, self.prop_hist_len, 32), device=self.device, dtype=torch.float)
 
     def _setup_reward_config(self, r_config):
         self.angvel_clip_min = r_config['angvelClipMin']
@@ -610,39 +606,29 @@ class AllegroHandHora(VecTask):
             self.object_asset_list.append(object_asset)
 
     def _init_object_pose(self):
-        _e = self.config['env']
         allegro_hand_start_pose = gymapi.Transform()
-        _hp = _e.get('handPos', [0, 0, 0.5])
-        allegro_hand_start_pose.p = gymapi.Vec3(_hp[0], _hp[1], _hp[2])
-        _rpy = _e.get('handRPY', None)
-        if _rpy is not None:
-            allegro_hand_start_pose.r = (
-                gymapi.Quat.from_axis_angle(gymapi.Vec3(0, 0, 1), _rpy[2])
-                * gymapi.Quat.from_axis_angle(gymapi.Vec3(0, 1, 0), _rpy[1])
-                * gymapi.Quat.from_axis_angle(gymapi.Vec3(1, 0, 0), _rpy[0]))
-        else:
-            allegro_hand_start_pose.r = gymapi.Quat.from_axis_angle(
-                gymapi.Vec3(0, 1, 0), -np.pi / 2) * gymapi.Quat.from_axis_angle(gymapi.Vec3(1, 0, 0), np.pi / 2)
+        allegro_hand_start_pose.p = gymapi.Vec3(0, 0, 0.5)
+        allegro_hand_start_pose.r = gymapi.Quat.from_axis_angle(
+            gymapi.Vec3(0, 1, 0), -np.pi / 2) * gymapi.Quat.from_axis_angle(gymapi.Vec3(1, 0, 0), np.pi / 2)
         object_start_pose = gymapi.Transform()
         object_start_pose.p = gymapi.Vec3()
-        pose_dx, pose_dy, pose_dz = _e.get('objOffset', [-0.01, -0.05, 0.15])
+        object_start_pose.p.x = allegro_hand_start_pose.p.x
+        pose_dx, pose_dy, pose_dz = -0.01, -0.04, 0.15
 
         object_start_pose.p.x = allegro_hand_start_pose.p.x + pose_dx
         object_start_pose.p.y = allegro_hand_start_pose.p.y + pose_dy
         object_start_pose.p.z = allegro_hand_start_pose.p.z + pose_dz
+
+        object_start_pose.p.y = allegro_hand_start_pose.p.y - 0.01
         # for grasp pose generation, it is used to initialize the object
         # it should be slightly higher than the fingertip
         # so it is set to be 0.66 for internal allegro and 0.64 for the public allegro
         # ----
         # for in-hand object rotation, the initialization of z is only used in the first step
         # it is set to be 0.65 for backward compatibility
-        _oz = self.config['env'].get('objZ', None)
-        if _oz is not None:
-            object_z = _oz
-        else:
-            object_z = 0.66 if self.save_init_pose else 0.65
-            if 'internal' not in self.grasp_cache_name:
-                object_z -= 0.02
+        object_z = 0.66 if self.save_init_pose else 0.65
+        if 'internal' not in self.grasp_cache_name:
+            object_z -= 0.02
         object_start_pose.p.z = object_z
         return allegro_hand_start_pose, object_start_pose
 

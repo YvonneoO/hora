@@ -1,0 +1,122 @@
+name: ShadowHandCubeRotation
+physics_engine: ${..physics_engine}
+on_evaluation: False
+
+env:
+  numEnvs: ${resolve_default:2048,${...num_envs}}
+  numObservations: 144
+  numActions: 24
+  envSpacing: 0.25
+  handPos: [0.0, 0.0, 0.5]
+  handRPY: [0.0, 0.0, 0.0]
+  objOffset: [0.0, -0.34, 0.0]
+  objZ: 0.57
+  graspCacheTarget: 50000
+  episodeLength: 400
+  enableDebugVis: False
+  aggregateMode: 1
+
+  controller:
+    torque_control: True
+    controlFrequencyInv: 12
+    pgain: 3
+    dgain: 0.1
+    actionEMA: 0.8
+
+  genGrasps: False
+  clipObservations: 5.0
+  clipActions: 1.0
+  reset_height_threshold: 0.48
+  grasp_cache_name: shadow_cube
+
+  forceScale: 0.0
+  randomForceProbScalar: 0.0
+  forceDecay: 0.9
+  forceDecayInterval: 0.08
+
+  hora:
+    propHistoryLen: 30
+    privInfoDim: 9
+
+  reward:
+    # Compatibility keys read by AllegroHandHora.__init__.
+    angvelClipMin: -0.5
+    angvelClipMax: 0.5
+    rotateRewardScale: 1.0
+    objLinvelPenaltyScale: -0.3
+    poseDiffPenaltyScale: -0.3
+    torquePenaltyScale: -0.1
+    workPenaltyScale: -2.0
+    # Cube finite-difference RWS reward.
+    spinRateScale: 10.0
+    spinClip: 3.1415926
+    spinCoef: 1.0
+    velCoef: -0.1
+    torqueCoef: -0.0003
+    workCoef: -0.0003
+    fingerCoef: 0.1
+    contactCoef: 0.0
+    contactThreshold: 0.5
+    fallPenalty: -50.0
+    successRotation: 6.2831853
+
+  baseObjScale: 0.7
+  randomization:
+    randomizeMass: False
+    randomizeMassLower: 0.05
+    randomizeMassUpper: 0.051
+    randomizeCOM: False
+    randomizeCOMLower: -0.0
+    randomizeCOMUpper: 0.0
+    randomizeFriction: False
+    randomizeFrictionLower: 1.0
+    randomizeFrictionUpper: 1.0
+    # This remains enabled so HORA loads the matching scale-indexed grasp cache.
+    randomizeScale: True
+    scaleListInit: True
+    randomizeScaleList: [0.7]
+    randomizeScaleLower: 0.7
+    randomizeScaleUpper: 0.7
+    randomizePDGains: False
+    randomizePGainLower: 3.0
+    randomizePGainUpper: 3.0
+    randomizeDGainLower: 0.1
+    randomizeDGainUpper: 0.1
+    jointNoiseScale: 0.0
+
+  privInfo:
+    enableObjPos: True
+    enableObjScale: True
+    enableObjMass: True
+    enableObjCOM: True
+    enableObjFriction: True
+
+  object:
+    type: cube
+    sampleProb: [1.0]
+
+  asset:
+    handAsset: assets/open_ai_assets/hand/shadow_hand.xml
+
+  enableCameraSensors: False
+
+sim:
+  dt: 0.0083333
+  substeps: 1
+  up_axis: z
+  use_gpu_pipeline: ${eq:${...pipeline},'gpu'}
+  gravity: [0.0, 0.0, -9.81]
+  physx:
+    num_threads: ${....num_threads}
+    solver_type: ${....solver_type}
+    use_gpu: ${contains:'cuda',${....sim_device}}
+    num_position_iterations: 8
+    num_velocity_iterations: 0
+    max_gpu_contact_pairs: 8388608
+    num_subscenes: ${....num_subscenes}
+    contact_offset: 0.002
+    rest_offset: 0.0
+    bounce_threshold_velocity: 0.2
+    max_depenetration_velocity: 1000.0
+    default_buffer_size_multiplier: 5.0
+    contact_collection: 2

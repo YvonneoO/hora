@@ -64,11 +64,8 @@ class AllegroHandGrasp(AllegroHandHora):
         _tgt = int(self.config['env'].get('graspCacheTarget', 50000))
         if len(self.saved_grasping_states) >= _tgt:
             name = f'cache/{self.grasp_cache_name}_grasp_50k_s{str(self.base_obj_scale).replace(".", "")}.npy'
-            _arr = self.saved_grasping_states[:_tgt].cpu().numpy()
-            import os as _os
-            np.save(name + '.tmp', _arr)
-            _os.replace(name + '.tmp.npy', name)
-            print('SAVED', name, 'n=', len(_arr), flush=True)
+            np.save(name, self.saved_grasping_states[:_tgt].cpu().numpy())
+            print('SAVED', name, 'n=', len(self.saved_grasping_states[:_tgt]))
             exit()
 
         # reset object

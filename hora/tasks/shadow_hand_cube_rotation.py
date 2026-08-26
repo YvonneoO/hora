@@ -1,0 +1,163 @@
+"""Cube-only ShadowHand in-hand rotation task.
+
+This is an additive experiment built on the working HORA ShadowHand simulator.
+It keeps the ball-policy observation/action interface intact for warm starting,
+but uses the finite-difference rotation signal and stability terms from RWS.
+"""
+
+import math
+
+import torch
+from isaacgym.torch_utils import quat_conjugate, quat_mul
+
+from hora.tasks.allegro_hand_hora import AllegroHandHora, quat_to_axis_angle
+
+
+class ShadowHandCubeRotation(AllegroHandHora):
+    """Rotate one cube about the hand's -z axis without dropping it."""
+
+    def __init__(self, config, sim_device, graphics_device_id, headless):
+        super().__init__(config, sim_device, graphics_device_id, headless)
+
+        reward_cfg = self.config["env"].get("reward", {})
+        controller_cfg = self.config["env"].get("controller", {})
+        self.action_ema = float(controller_cfg.get("actionEMA", 0.8))
+        self.spin_rate_scale = float(reward_cfg.get("spinRateScale", 10.0))
+        self.spin_clip = float(reward_cfg.get("spinClip", math.pi))
+        self.spin_coef = float(reward_cfg.get("spinCoef", 1.0))
+        self.vel_coef = float(reward_cfg.get("velCoef", -0.1))
+        self.torque_coef = float(reward_cfg.get("torqueCoef", -3.0e-4))
+        self.work_coef = float(reward_cfg.get("workCoef", -3.0e-4))
+        self.finger_coef = float(reward_cfg.get("fingerCoef", 0.1))
+        self.contact_coef = float(reward_cfg.get("contactCoef", 0.0))
+        self.contact_threshold = float(reward_cfg.get("contactThreshold", 0.5))
+        self.fall_penalty = float(reward_cfg.get("fallPenalty", -50.0))
+        self.success_rotation = float(reward_cfg.get("successRotation", 2.0 * math.pi))
+
+        # ShadowHand fingertip rigid-body indices used by the existing adaptation.
+        self.ftip_body_idx = [7, 11, 15, 20, 25]
+        self.obj_body_idx = self.num_allegro_hand_bodies
+        self.smoothed_actions = torch.zeros(
+            (self.num_envs, self.num_actions), dtype=torch.float, device=self.device
+        )
+        self.cumulative_rotation = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
+        self.successes = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
+        self.rotation_success_latched = torch.zeros(
+            self.num_envs, dtype=torch.bool, device=self.device
+        )
+        self.stat_full_rotation_success = torch.tensor(0.0, device=self.device)
+
+    def pre_physics_step(self, actions):
+        # RWS uses EMA-smoothed relative targets. Calling the HORA implementation
+        # preserves its action scale and checkpoint-compatible control interface.
+        self.smoothed_actions.mul_(1.0 - self.action_ema).add_(actions, alpha=self.action_ema)
+        super().pre_physics_step(self.smoothed_actions)
+
+    def _signed_rotation_delta(self):
+        """Shortest physical rotation-vector component around world -z.
+
+        Projecting a body-fixed cube axis into the xy plane is singular when
+        that axis becomes nearly vertical. Switching between projected x/y
+        axes at the singularity produced large artificial jumps and allowed
+        rocking/tilting to count as multiple complete rotations.  The relative
+        quaternion has no such representation switch: its axis-angle vector is
+        the finite physical rotation over the control step, which we project
+        onto the desired world axis.
+        """
+        axis = torch.zeros(
+            (self.num_envs, 3), dtype=torch.float, device=self.object_rot.device
+        )
+        axis[:, 2] = -1.0
+        relative = quat_mul(self.object_rot, quat_conjugate(self.object_rot_prev))
+        # q and -q encode the same rotation; choose the short arc so a sign
+        # flip cannot introduce a near-2pi step.
+        relative = torch.where(relative[:, 3:4] < 0.0, -relative, relative)
+        rotation_vector = quat_to_axis_angle(relative)
+        return (rotation_vector * axis).sum(-1)
+
+    def compute_reward(self, actions):
+        delta_theta = self._signed_rotation_delta()
+        spin_signal = torch.clamp(
+            delta_theta * self.spin_rate_scale, -self.spin_clip, self.spin_clip
+        )
+        self.cumulative_rotation.add_(delta_theta)
+
+        control_dt = self.control_freq_inv * self.dt
+        object_linvel = (self.object_pos - self.object_pos_prev) / control_dt
+        vel_penalty = torch.linalg.norm(object_linvel, dim=-1)
+        torque_penalty = (self.torques ** 2).sum(-1)
+        work_penalty = (torch.abs(self.torques) * torch.abs(self.dof_vel_finite_diff)).sum(-1)
+
+        obj_pos = self.rigid_body_states[:, self.obj_body_idx, :3]
+        ftip_pos = self.rigid_body_states[:, self.ftip_body_idx, :3]
+        ftip_dist = torch.linalg.norm(ftip_pos - obj_pos.unsqueeze(1), dim=-1)
+        proximity = torch.clamp(0.1 / (4.0 * ftip_dist + 0.02), 0.0, 1.0).mean(-1)
+        tip_force = torch.linalg.norm(self.contact_forces[:, self.ftip_body_idx, :], dim=-1)
+        contact_count = (tip_force > self.contact_threshold).float().sum(-1)
+
+        reward = (
+            self.spin_coef * spin_signal
+            + self.vel_coef * vel_penalty
+            + self.finger_coef * proximity
+            + self.contact_coef * contact_count
+            + self.torque_coef * torque_penalty
+            + self.work_coef * work_penalty
+        )
+
+        dropped = self.object_pos[:, 2] < self.reset_z_threshold
+        timed_out = self.progress_buf >= self.max_episode_length
+        reward = torch.where(dropped, reward + self.fall_penalty, reward)
+        self.rew_buf[:] = reward
+        self.reset_buf[:] = dropped | timed_out
+
+        reached = self.cumulative_rotation >= self.success_rotation
+        new_success = reached & ~self.rotation_success_latched
+        self.successes.add_(new_success.float())
+        self.rotation_success_latched |= reached
+
+        self.extras["rotation_reward"] = spin_signal.mean()
+        self.extras["signed_delta_rad"] = delta_theta.mean()
+        self.extras["cumulative_rotation_rad"] = self.cumulative_rotation.mean()
+        self.extras["object_linvel"] = vel_penalty.mean()
+        self.extras["finger_proximity"] = proximity.mean()
+        self.extras["tip_contact_count"] = contact_count.mean()
+        self.extras["drop_fraction"] = dropped.float().mean()
+        self.extras["full_rotation_success"] = self.rotation_success_latched.float().mean()
+        self.extras["episode_progress_fraction"] = (
+            self.progress_buf.float() / float(self.max_episode_length)
+        ).mean()
+
+        if self.evaluate:
+            finished = self.reset_buf.bool()
+            self.stat_sum_rewards += self.rew_buf.sum()
+            self.stat_sum_rotate_rewards += spin_signal.sum()
+            self.stat_sum_torques += self.torques.abs().sum()
+            self.stat_sum_obj_linvel += (object_linvel ** 2).sum(-1).sum()
+            self.stat_sum_episode_length += (~finished).sum()
+            self.stat_full_rotation_success += self.rotation_success_latched[finished].float().sum()
+            self.env_evaluated += finished.sum()
+            self.env_timeout_counter[finished] += 1
+            if self.env_evaluated > 0:
+                episodes = self.env_evaluated.float()
+                steps = torch.clamp(self.stat_sum_episode_length.float(), min=1.0)
+                print(
+                    "cube_eval "
+                    f"episodes={int(self.env_evaluated)} "
+                    f"reward={float(self.stat_sum_rewards / episodes):.3f} "
+                    f"episode_length={float(self.stat_sum_episode_length / episodes):.2f} "
+                    f"rotation_signal={float(self.stat_sum_rotate_rewards / episodes):.3f} "
+                    f"full_rotation_success={float(self.stat_full_rotation_success / episodes):.4f} "
+                    f"linvel_x100={float(self.stat_sum_obj_linvel * 100.0 / steps):.4f} "
+                    f"command_torque={float(self.stat_sum_torques / steps):.3f}",
+                    flush=True,
+                )
+            if self.env_evaluated >= self.max_evaluate_envs:
+                raise SystemExit(0)
+
+    def reset_idx(self, env_ids):
+        super().reset_idx(env_ids)
+        if hasattr(self, "smoothed_actions"):
+            self.smoothed_actions[env_ids] = 0.0
+            self.cumulative_rotation[env_ids] = 0.0
+            self.successes[env_ids] = 0.0
+            self.rotation_success_latched[env_ids] = False
