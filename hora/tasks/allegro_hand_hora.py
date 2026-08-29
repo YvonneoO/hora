@@ -369,12 +369,19 @@ class AllegroHandHora(VecTask):
         )
         dropped = torch.less(self.object_pos[:, -1], self.reset_z_threshold)
         timed_out = torch.greater_equal(self.progress_buf, self.max_episode_length)
-        self.reset_buf[:] = torch.logical_or(dropped, timed_out)
+        resets = torch.logical_or(dropped, timed_out)
+        self.reset_buf[:] = resets
         # success: episode ran to full length (never dropped) AND rotated at least
         # half a turn about the target axis -- see success_rotation_threshold above.
         success = torch.logical_and(timed_out, self.net_rotation_buf >= self.success_rotation_threshold)
-        if self.reset_buf.any():
-            self.extras['success'] = success[self.reset_buf].float().mean()
+        if resets.any():
+            # NOTE: self.reset_buf is long-dtype (0/1 values), so indexing with it
+            # directly is integer fancy-indexing (gather), not a boolean mask -- use
+            # the bool `resets` computed above instead. (Previously used
+            # success[self.reset_buf], which silently computed a meaningless
+            # quantity at num_envs>1 -- always in-bounds so it never crashed there --
+            # and crashed outright at num_envs=1 during rollout inspection.)
+            self.extras['success'] = success[resets].float().mean()
         self.extras['rotation_reward'] = rotate_reward.mean()
         self.extras['object_linvel_penalty'] = object_linvel_penalty.mean()
         self.extras['pose_diff_penalty'] = pose_diff_penalty.mean()
