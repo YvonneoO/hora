@@ -12,6 +12,10 @@ env:
   # blind proprio+history obs above. See allegro_hand_hora.py's
   # _setup_coarse_tactile_tables/_compute_coarse_tactile for what "coarse" means here.
   coarseTactile: False
+  # checkpoint-sweep eval target (see sweep_checkpoint_eval.py); 500000 is the
+  # original single-thorough-eval default, override to something small for a
+  # fast per-checkpoint pass.
+  evalTargetEpisodes: 500000
   envSpacing: 0.25
   # --- Shadow init-pose tuning (read by config-driven _init_object_pose) ---
   handPos: [0.0, 0.0, 0.5]
