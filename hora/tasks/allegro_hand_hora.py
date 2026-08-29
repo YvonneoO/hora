@@ -97,6 +97,11 @@ class AllegroHandHora(VecTask):
             assert self.save_init_pose
 
         self.rot_axis_buf = torch.zeros((self.num_envs, 3), device=self.device, dtype=torch.float)
+        # net rotation about the target axis accumulated since the last reset (radians,
+        # unclipped) -- used to define a binary success criterion for the tactile-SR
+        # ablation, since this task otherwise only reports continuous reward.
+        self.net_rotation_buf = torch.zeros((self.num_envs,), device=self.device, dtype=torch.float)
+        self.success_rotation_threshold = float(np.pi)  # half a full turn, matches VTDexManip's In-hand Reorientation criterion
 
         # useful buffers
         self.object_rot_prev = self.object_rot.clone()
@@ -116,6 +121,7 @@ class AllegroHandHora(VecTask):
         self.stat_sum_episode_length = 0
         self.stat_sum_obj_linvel = 0
         self.stat_sum_torques = 0
+        self.stat_sum_success = 0
         self.env_evaluated = 0
         self.max_evaluate_envs = 500000
 
@@ -289,6 +295,7 @@ class AllegroHandHora(VecTask):
         self.rb_forces[env_ids] = 0
         self.priv_info_buf[env_ids, 0:3] = 0
         self.proprio_hist_buf[env_ids] = 0
+        self.net_rotation_buf[env_ids] = 0
         self.at_reset_buf[env_ids] = 1
 
     def compute_observations(self):
@@ -330,6 +337,8 @@ class AllegroHandHora(VecTask):
         object_angvel = angdiff / (self.control_freq_inv * self.dt)
         vec_dot = (object_angvel * self.rot_axis_buf).sum(-1)
         rotate_reward = torch.clip(vec_dot, max=self.angvel_clip_max, min=self.angvel_clip_min)
+        # raw (unclipped) radians turned about the target axis this control step
+        self.net_rotation_buf += (angdiff * self.rot_axis_buf).sum(-1)
         # linear velocity: use position difference instead of self.object_linvel
         object_linvel = ((self.object_pos - self.object_pos_prev) / (self.control_freq_inv * self.dt)).clone()
         object_linvel_penalty = torch.norm(object_linvel, p=1, dim=-1)
@@ -341,7 +350,14 @@ class AllegroHandHora(VecTask):
             torque_penalty, self.torque_penalty_scale,
             work_penalty, self.work_penalty_scale,
         )
-        self.reset_buf[:] = self.check_termination(self.object_pos)
+        dropped = torch.less(self.object_pos[:, -1], self.reset_z_threshold)
+        timed_out = torch.greater_equal(self.progress_buf, self.max_episode_length)
+        self.reset_buf[:] = torch.logical_or(dropped, timed_out)
+        # success: episode ran to full length (never dropped) AND rotated at least
+        # half a turn about the target axis -- see success_rotation_threshold above.
+        success = torch.logical_and(timed_out, self.net_rotation_buf >= self.success_rotation_threshold)
+        if self.reset_buf.any():
+            self.extras['success'] = success[self.reset_buf].float().mean()
         self.extras['rotation_reward'] = rotate_reward.mean()
         self.extras['object_linvel_penalty'] = object_linvel_penalty.mean()
         self.extras['pose_diff_penalty'] = pose_diff_penalty.mean()
@@ -358,12 +374,14 @@ class AllegroHandHora(VecTask):
             self.stat_sum_torques += self.torques.abs().sum()
             self.stat_sum_obj_linvel += (self.object_linvel ** 2).sum(-1).sum()
             self.stat_sum_episode_length += (self.reset_buf == 0).sum()
+            self.stat_sum_success += success[finished_episode_mask].float().sum()
             self.env_evaluated += (self.reset_buf == 1).sum()
             self.env_timeout_counter[finished_episode_mask] += 1
             info = f'progress {self.env_evaluated} / {self.max_evaluate_envs} | ' \
                    f'reward: {self.stat_sum_rewards / self.env_evaluated:.2f} | ' \
                    f'eps length: {self.stat_sum_episode_length / self.env_evaluated:.2f} | ' \
                    f'rotate reward: {self.stat_sum_rotate_rewards / self.env_evaluated:.2f} | ' \
+                   f'success rate: {100.0 * self.stat_sum_success / self.env_evaluated:.2f}% | ' \
                    f'lin vel (x100): {self.stat_sum_obj_linvel * 100 / self.stat_sum_episode_length:.4f} | ' \
                    f'command torque: {self.stat_sum_torques / self.stat_sum_episode_length:.2f}'
             tprint(info)
