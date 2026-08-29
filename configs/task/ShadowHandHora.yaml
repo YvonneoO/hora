@@ -8,6 +8,10 @@ env:
   numEnvs: ${resolve_default:16384,${...num_envs}}
   numObservations: 144
   numActions: 24
+  # tactile-SR ablation: append a 217-taxel/hand coarse pressure channel to the
+  # blind proprio+history obs above. See allegro_hand_hora.py's
+  # _setup_coarse_tactile_tables/_compute_coarse_tactile for what "coarse" means here.
+  coarseTactile: False
   envSpacing: 0.25
   # --- Shadow init-pose tuning (read by config-driven _init_object_pose) ---
   handPos: [0.0, 0.0, 0.5]

@@ -43,6 +43,18 @@ class AllegroHandHora(VecTask):
             'obj_com': (6, 9),
         }
 
+        # coarse tactile ablation arm: append a 217-taxel/hand pressure channel to obs,
+        # reusing the same body->cell geometry as bidexhands' egotouch_taxels.py (see
+        # _setup_coarse_tactile_tables). proprio_obs_dim keeps the original 3-frame
+        # history block size separate from the total, since proprio_hist_buf below
+        # assumes numObservations == 3 * per-frame-dim -- the tactile channel is
+        # current-frame-only and must not be folded into that history stack.
+        self.proprio_obs_dim = config['env']['numObservations']
+        self.tactile_enabled = bool(config['env'].get('coarseTactile', False))
+        self.tactile_dim = 217 if self.tactile_enabled else 0
+        if self.tactile_enabled:
+            config['env']['numObservations'] = self.proprio_obs_dim + self.tactile_dim
+
         super().__init__(config, sim_device, graphics_device_id, headless)
 
         self.debug_viz = self.config['env']['enableDebugVis']
@@ -296,6 +308,8 @@ class AllegroHandHora(VecTask):
         self.priv_info_buf[env_ids, 0:3] = 0
         self.proprio_hist_buf[env_ids] = 0
         self.net_rotation_buf[env_ids] = 0
+        if self.tactile_enabled:
+            self.tactile_running_max[env_ids] = 0
         self.at_reset_buf[env_ids] = 1
 
     def compute_observations(self):
@@ -324,6 +338,9 @@ class AllegroHandHora(VecTask):
 
         self.proprio_hist_buf[:] = self.obs_buf_lag_history[:, -self.prop_hist_len:].clone()
         self._update_priv_buf(env_id=range(self.num_envs), name='obj_position', value=self.object_pos.clone())
+
+        if self.tactile_enabled:
+            self.obs_buf[:, self.proprio_obs_dim:self.proprio_obs_dim + self.tactile_dim] = self._compute_coarse_tactile()
 
     def compute_reward(self, actions):
         self.rot_axis_buf[:, -1] = -1
@@ -589,7 +606,7 @@ class AllegroHandHora(VecTask):
         self.prop_hist_len = self.config['env']['hora']['propHistoryLen']
         self.num_env_factors = self.config['env']['hora']['privInfoDim']
         self.priv_info_buf = torch.zeros((num_envs, self.num_env_factors), device=self.device, dtype=torch.float)
-        self.proprio_hist_buf = torch.zeros((num_envs, self.prop_hist_len, self.config['env']['numObservations'] // 3), device=self.device, dtype=torch.float)
+        self.proprio_hist_buf = torch.zeros((num_envs, self.prop_hist_len, self.proprio_obs_dim // 3), device=self.device, dtype=torch.float)
 
     def _setup_reward_config(self, r_config):
         self.angvel_clip_min = r_config['angvelClipMin']
@@ -599,6 +616,82 @@ class AllegroHandHora(VecTask):
         self.pose_diff_penalty_scale = r_config['poseDiffPenaltyScale']
         self.torque_penalty_scale = r_config['torquePenaltyScale']
         self.work_penalty_scale = r_config['workPenaltyScale']
+
+    def _setup_coarse_tactile_tables(self):
+        """Build the static body-force -> 217-taxel/hand pressure scatter tables.
+
+        Reuses the exact anatomical layout and per-body physical contact area from
+        bidexhands' egotouch_taxels.py (the same mapper used to build the real
+        tactile-prediction training data) so the units and cell semantics match --
+        but as a fixed body->cell scatter matrix instead of that module's per-contact
+        offline Gaussian projection, which is CPU/per-env and far too slow to run
+        live across thousands of parallel envs. This trades away within-body spatial
+        resolution (force is spread uniformly over a body's assigned cells rather
+        than localized to the exact contact point) for a batched GPU op that keeps
+        full training throughput -- see the coarse-tactile discussion in the sim
+        finetune docs for why this is labeled "coarse", not "GT-taxel".
+        """
+        if not self.tactile_enabled:
+            return
+        dex_root = os.environ.get('DEXTEROUSHANDS_ROOT')
+        if not dex_root:
+            raise RuntimeError(
+                'DEXTEROUSHANDS_ROOT must be set to build the coarse-tactile geometry '
+                '(reuses bidexhands/tactile_collection/egotouch_taxels.py)')
+        import sys
+        if dex_root not in sys.path:
+            sys.path.insert(0, dex_root)
+        from bidexhands.tactile_collection.egotouch_taxels import _load_valid_cells, _layout, _body_geometry
+
+        mapping_path = os.path.join(
+            dex_root, 'bidexhands/tactile_collection/assets/pressure_position_mapping_right.json')
+        valid_cells = _load_valid_cells(mapping_path)
+        # Both hand sides share the same canonical chart mask (see egotouch_taxels.py's
+        # own comment); "right" is an arbitrary but consistent choice here.
+        groups = _layout('right', valid_cells)
+        cell_order = sorted(valid_cells)
+        cell_index = {rc: i for i, rc in enumerate(cell_order)}
+        assert len(cell_order) == 217
+
+        palm_area_m2 = 0.064 * 0.098 + 0.022 * 0.050
+
+        names = self.gym.get_asset_rigid_body_names(self.hand_asset)
+        body_idx, body_area, scatter_rows = [], [], []
+        for local_idx, full_name in enumerate(names):
+            suffix = full_name.split(':')[-1]
+            if suffix not in groups or not groups[suffix]:
+                continue
+            if suffix == 'palm':
+                area = palm_area_m2
+            else:
+                width, length = _body_geometry(suffix)
+                area = width * length
+            row = torch.zeros(len(cell_order), dtype=torch.float32)
+            for rc in groups[suffix]:
+                row[cell_index[rc]] = 1.0
+            body_idx.append(local_idx)
+            body_area.append(area)
+            scatter_rows.append(row)
+
+        if not body_idx:
+            raise RuntimeError('No hand bodies matched the EgoTouch taxel layout -- check body naming.')
+
+        self.tactile_body_idx = torch.tensor(body_idx, dtype=torch.long, device=self.device)
+        self.tactile_body_area = torch.tensor(body_area, dtype=torch.float32, device=self.device)
+        self.tactile_scatter = torch.stack(scatter_rows, dim=0).to(self.device)  # (K, 217)
+        self.tactile_running_max = torch.zeros((self.num_envs,), dtype=torch.float32, device=self.device)
+
+    def _compute_coarse_tactile(self):
+        """Per-step: per-body contact force -> pressure -> scattered onto 217 cells,
+        then normalized by each env's own running-max-so-far (causal approximation of
+        the per-sequence max normalization used for the real training data / for
+        v2-dit's predicted output, since online rollout can't see the future max)."""
+        body_force = torch.linalg.norm(self.contact_forces[:, self.tactile_body_idx, :], dim=-1)  # (N, K)
+        body_pressure = body_force / self.tactile_body_area.unsqueeze(0)  # (N, K), Pa
+        taxel_pressure = body_pressure @ self.tactile_scatter  # (N, 217), Pa
+        self.tactile_running_max = torch.maximum(self.tactile_running_max, taxel_pressure.max(dim=-1).values)
+        denom = torch.clamp(self.tactile_running_max, min=1e-6).unsqueeze(-1)
+        return taxel_pressure / denom
 
     def _create_object_asset(self):
         # object file to asset
@@ -618,6 +711,7 @@ class AllegroHandHora(VecTask):
         else:
             hand_asset_options.default_dof_drive_mode = gymapi.DOF_MODE_POS
         self.hand_asset = self.gym.load_asset(self.sim, asset_root, hand_asset_file, hand_asset_options)
+        self._setup_coarse_tactile_tables()
 
         # load object asset
         self.object_asset_list = []
