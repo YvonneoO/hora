@@ -135,7 +135,10 @@ class AllegroHandHora(VecTask):
         self.stat_sum_torques = 0
         self.stat_sum_success = 0
         self.env_evaluated = 0
-        self.max_evaluate_envs = 500000
+        # config-overridable (task.env.evalTargetEpisodes=N) so a checkpoint sweep
+        # for a success-rate-vs-training-step curve can use a short, fast target
+        # instead of the 500000-episode default meant for a single thorough eval.
+        self.max_evaluate_envs = self.config['env'].get('evalTargetEpisodes', 500000)
 
     def _create_envs(self, num_envs, spacing, num_per_row):
         self._create_ground_plane()
