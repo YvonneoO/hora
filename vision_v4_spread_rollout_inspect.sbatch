@@ -29,13 +29,21 @@ mkdir -p "${YQQ}/logs" "${YQQ}/tmp"
 export TMPDIR="${YQQ}/tmp"
 export HF_HOME="${YQQ}/.cache/huggingface"
 export TORCH_HOME="${YQQ}/.cache/torch"
+export TORCH_EXTENSIONS_DIR="${YQQ}/.cache/torch_extensions"
 export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-4}"
 export MKL_NUM_THREADS="${SLURM_CPUS_PER_TASK:-4}"
+export PYTHONUNBUFFERED=1
 
 export HORA_ROOT="${YQQ}/hora"
 export DEXTEROUSHANDS_ROOT="${YQQ}/DexterousHands"
-export PYTHON_BIN="${YQQ}/envs/bidexhands_isaacgym_py38/bin/python"
-export PYTHON_ENV_ROOT="${YQQ}/envs/bidexhands_isaacgym_py38"
+export ISAACGYM_ROOT="${YQQ}/isaacgym"
+export ISAACGYM_ENV="${YQQ}/envs/bidexhands_isaacgym_py38"
+export PYTHON_BIN="${ISAACGYM_ENV}/bin/python"
+export PYTHON_ENV_ROOT="${ISAACGYM_ENV}"
+
+export PATH="${ISAACGYM_ENV}/bin:${PATH}"
+export LD_LIBRARY_PATH="${ISAACGYM_ENV}/lib:${LD_LIBRARY_PATH:-}"
+export PYTHONPATH="${ISAACGYM_ROOT}/python:${PYTHONPATH:-}"
 export GPU_ID=0
 export GRAPHICS_DEVICE_ID=0
 
